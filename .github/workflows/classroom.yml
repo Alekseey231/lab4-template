@@ -1,4 +1,4 @@
-name: GitHub Classroom Workflow
+name: Microservices CI
 on:
   push:
     branches:
@@ -6,30 +6,172 @@ on:
   pull_request:
     branches:
       - master
+
 jobs:
   build:
-    name: Autograding
+    name: Build Services
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service:
+          - { name: 'gateway', path: 'GatewayService' }
+          - { name: 'library', path: 'LibraryService' }
+          - { name: 'rating', path: 'RatingService' }
+          - { name: 'reservation', path: 'ReservationService' }
+    
     steps:
       - uses: actions/checkout@v4
+
+      - name: Setup dotnet
+        uses: actions/setup-dotnet@v4
         with:
-          fetch-depth: 0
+          dotnet-version: '8.0.x'
 
-      - uses: docker/setup-buildx-action@v2
+      - name: Run Unit Tests
+        run: |
+          cd services/${{ matrix.service.path }}
+          if [ -d "src/Tests" ]; then
+            dotnet test src/${{ matrix.service.path }}.sln
+          else
+            echo "No tests found for ${{ matrix.service.name }}, skipping..."
+          fi
 
-      # TODO build and run unit tests
+      - name: Auth Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build images
-        timeout-minutes: 10
-        run: docker compose build --push
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: services/${{ matrix.service.path }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: xom4ik/${{ matrix.service.name }}-service:latest
+          cache-from: type=registry,ref=xom4ik/${{ matrix.service.name }}-service:latest
+          cache-to: type=inline
 
-      # TODO deploy to k8s with liveness and readyness probes
+  deploy:
+    name: Deploy to Minikube
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Wait before services are ready
-        run: kubectl wait -n test -l app.kubernetes.io/name=gateway pod --for=condition=Ready --timeout 3m
-      
-      # TODO setup parameters in classroom/autograding.json
-      
+      - name: Setup Minikube
+        uses: manusa/actions-setup-minikube@v2
+        with:
+          minikube version: 'v1.32.0'
+          kubernetes version: 'v1.28.0'
+          driver: docker
+
+      - name: Start Minikube
+        run: |
+          minikube start
+          minikube addons enable ingress
+
+      - name: Install Helm charts
+        run: |
+          helm install database ./k8s/db/
+          
+          kubectl wait --for=condition=ready pod -l app=postgres --timeout=300s
+          
+          helm install services ./k8s/services/
+
+          kubectl wait --for=condition=ready pod -l app=gateway-service --timeout=600s
+          kubectl wait --for=condition=ready pod -l app=library-service --timeout=600s  
+          kubectl wait --for=condition=ready pod -l app=rating-service --timeout=600s
+          kubectl wait --for=condition=ready pod -l app=reservation-service --timeout=600s
+
+      - name: Install Ingress
+        run: |
+          kubectl apply -f ./k8s/ingress.yaml
+
+      - name: Wait for Ingress to get address
+        run: |
+          echo "Waiting for Ingress to be assigned an address..."
+          
+          for i in {1..30}; do 
+            echo "Attempt $i: Checking Ingress status..."
+            
+            INGRESS_ADDRESS=$(kubectl get ingress -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+            
+            if [ -z "$INGRESS_ADDRESS" ]; then
+              INGRESS_ADDRESS=$(kubectl get ingress -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+            fi
+            
+            if [ -n "$INGRESS_ADDRESS" ]; then
+              echo "Ingress is ready! Address: $INGRESS_ADDRESS"
+              break
+            fi
+            
+            echo "Ingress address not yet assigned, waiting 10 seconds..."
+            sleep 10
+            
+            if [ $i -eq 30 ]; then
+              echo "Timeout waiting for Ingress address after 5 minutes"
+              echo "=== Current Ingress status ==="
+              kubectl describe ingress
+              echo "=== Ingress controller logs ==="
+              kubectl logs -l app.kubernetes.io/name=ingress-nginx -n ingress-nginx --tail=50
+              exit 1
+            fi
+          done
+        
+      - name: Setup port-forward for tests
+        run: |
+          echo "Starting port-forward to ingress on port 80..."
+          kubectl port-forward service/ingress-nginx-controller -n ingress-nginx 80:80 &
+          echo $! > /tmp/pf.pid
+          sleep 5
+          
+          # Проверяем что работает
+          curl -f http://localhost:80/health
+
+      - name: Run API Tests
+        timeout-minutes: 5
+        run: ./scripts/test-script.sh
+        env:
+          VARIANT: v4
+          DEPLOYMENT: rating-service-deployment
+          NAMESPACE: default  
+
+      - name: Show logs
+        if: failure()
+        run: |
+          for pod in $(kubectl get pods -l app -o jsonpath='{.items[*].metadata.name}'); do
+            echo "=== Logs for pod: $pod ==="
+            kubectl logs $pod
+            echo "=== End logs for $pod ==="
+            echo
+          done
+      - name: Stop port-forward
+        if: always()
+        run: |
+          if [ -f /tmp/pf.pid ]; then
+            kill $(cat /tmp/pf.pid) 2>/dev/null || true
+            rm -f /tmp/pf.pid
+          fi
+
+      - name: Stop Minikube
+        if: always()
+        run: |
+          echo "Stopping Minikube..."
+          minikube stop
+
       - name: Autograding
         uses: education/autograding@v1
+        continue-on-error: true
+
+      - name: Github auto grader mark
+        uses: Romanow/google-sheet-autograder-marker@v1.0
+        with:
+          google_token: ${{secrets.GOOGLE_API_KEY}}
+          sheet_id: "1xkgjUX6Qmk7rdJG-QPOToav-HWWtthJjnShIKnw3oIY"
+          homework_number: 1
+          user_column: 'D'
+          column_offset: 'F'
+          mark: "'+"
         continue-on-error: true
