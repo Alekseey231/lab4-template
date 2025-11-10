@@ -1,7 +1,7 @@
 global:
   postgresSecret: postgres-secret
   database:
-    host: postgres
+    host: postgres-svc
     port: 5432
 
 services:
