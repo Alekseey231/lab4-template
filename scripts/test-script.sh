@@ -40,12 +40,10 @@ step() {
 
   kubectl scale deployment "$deployment" -n "$namespace" --replicas "$replicas" 
 
-  if [[ $replicas -eq 0 ]]; then
-    echo "Waiting for $deployment to scale down..."
-    kubectl wait --for=jsonpath='{.status.readyReplicas}'=0 deployment/$deployment -n $namespace --timeout=30s
-  else
+  if [[ $replicas -eq 1 ]]; then
     echo "Waiting for $deployment to be ready..."
-    kubectl wait --for=condition=ready pod -l app=$deployment -n $namespace --timeout=30s
+    kubectl rollout status deployment/$deployment -n $namespace --timeout=45s
+    echo "Deployment is ready"
   fi
 
   newman run \
