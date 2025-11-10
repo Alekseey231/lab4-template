@@ -36,6 +36,13 @@ jobs:
             echo "No tests found for ${{ matrix.service.name }}, skipping..."
           fi
 
+      - name: Publish .NET application
+        run: |
+          cd services/${{ matrix.service.path }}
+          dotnet publish src/${{ matrix.service.path }}.Server/${{ matrix.service.path }}.Server.csproj \
+            -c Release \
+            -o ${{ matrix.service.path }}Publish/
+
       - name: Auth Docker Hub
         uses: docker/login-action@v3
         with:
